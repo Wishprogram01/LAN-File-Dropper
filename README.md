@@ -1,4 +1,4 @@
-# 🚀 lan-drop
+# 🚀 LAN-File-Dropper
 
 [![CI & Release](https://github.com/Wishprogram01/LAN-File-Dropper/actions/workflows/release.yml/badge.svg)](https://github.com/Wishprogram01/LAN-File-Dropper/actions)
 ![Rust](https://img.shields.io/badge/Language-Rust_2021-orange?logo=rust)
