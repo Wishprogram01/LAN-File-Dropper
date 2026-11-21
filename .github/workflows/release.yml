@@ -1,0 +1,54 @@
+name: CI & Automated Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-test:
+    name: Cargo Check & Test (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      - run: cargo test --locked
+
+  build-binaries:
+    name: Build Release ({{ matrix.os }})
+    needs: check-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: lan-drop
+            asset_name: lan-drop-linux-x86_64
+          - os: macos-latest
+            artifact_name: lan-drop
+            asset_name: lan-drop-macos-arm64
+          - os: windows-latest
+            artifact_name: lan-drop.exe
+            asset_name: lan-drop-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+
+      - name: Rename binary for release
+        shell: bash
+        run: cp target/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+          generate_release_notes: true
