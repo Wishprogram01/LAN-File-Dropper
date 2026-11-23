@@ -3,6 +3,7 @@ mod discovery;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use dialoguer::{theme::ColorfulTheme, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,9 @@ enum Commands {
         port: u16,
         #[arg(long)]
         pin: Option<String>,
+        /// Nama paparan peranti dalam senarai picker
+        #[arg(short, long)]
+        name: Option<String>,
     },
     /// Cari penerima secara automatik & hantar fail dengan penyulitan AES-256-GCM
     Send {
@@ -50,11 +54,29 @@ struct FileHeader {
     sha256: String,
 }
 
+fn print_banner(subtitle: &str) {
+    // Bersihkan skrin terminal supaya UI nampak kemas macam TUI penuh
+    print!("\x1b[2J\x1b[1;1H");
+    println!(
+        "\x1b[1;36m\
+╔══════════════════════════════════════════════════════════════════════╗
+║  _        _    _   _       ____  ____   ___  ____  ____  _____ ____  ║
+║ | |      / \\  | \\ | |     |  _ \\|  _ \\ / _ \\|  _ \\|  _ \\| ____|  _ \\ ║
+║ | |     / _ \\ |  \\| |_____| | | | |_) | | | | |_) | |_) |  _| | |_) |║
+║ | |___ / ___ \\| |\\  |_____| |_| |  _ <| |_| |  __/|  __/| |___|  _ < ║
+║ |_____/_/   \\_\\_| \\_|     |____/|_| \\_\\\\___/|_|   |_|   |_____|_| \\_\\║
+║                                                                      ║
+║         \x1b[1;32m⚡ LAN-DROPPER FILE BY ZWDEVS ⚡\x1b[1;36m  \x1b[0;37m[v0.2.0 • AES-256-GCM]\x1b[1;36m     ║
+╚══════════════════════════════════════════════════════════════════════╝\x1b[0m"
+    );
+    println!("  \x1b[1;33m▸ {}\x1b[0m\n", subtitle);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Receive { port, pin } => receive_file(port, pin).await,
+        Commands::Receive { port, pin, name } => receive_file(port, pin, name).await,
         Commands::Send { file, addr, pin } => send_file(&file, addr, pin).await,
     }
 }
@@ -65,7 +87,7 @@ fn make_progress_bar(total: u64) -> Result<ProgressBar> {
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:35.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
         )?
-        .progress_chars("#>-"),
+        .progress_chars("█▓░"),
     );
     Ok(pb)
 }
@@ -94,12 +116,38 @@ async fn send_file(path: &Path, addr: Option<String>, pin_opt: Option<String>) -
         .to_string();
 
     let target = match addr {
-        Some(a) => a,
+        Some(a) => {
+            print_banner(&format!("MOD TERUS KE SERVER: {}", a));
+            a
+        }
         None => {
-            println!("🔍 Mencari peranti penerima dalam rangkaian LAN...");
-            let (peer_addr, host) = discovery::find_peer().await?;
-            println!("✅ Ditemui '{}' di {}", host, peer_addr);
-            peer_addr.to_string()
+            println!("🔍 Mengimbas peranti penerima dalam rangkaian LAN (2 saat)...");
+            let peers = discovery::find_peers(2).await?;
+            if peers.is_empty() {
+                bail!("❌ Tiada peranti penerima ditemui. Pastikan penerima aktif atau guna --addr.");
+            }
+
+            let items: Vec<String> = peers
+                .iter()
+                .map(|p| format!("💻 {} ({})", p.name, p.addr))
+                .collect();
+
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Pilih peranti penerima (↑/↓ & Enter)")
+                .items(&items)
+                .default(0)
+                .interact()?;
+
+            let chosen = &peers[selection];
+
+            // Paparkan ASCII Art UI sebaik sahaja server dipilih!
+            print_banner(&format!(
+                "DISAMBUNGKAN KE SERVER: {} ({})",
+                chosen.name, chosen.addr
+            ));
+            println!("📦 Fail Sasaran : \x1b[1;37m{}\x1b[0m", filename);
+
+            chosen.addr.to_string()
         }
     };
 
@@ -121,8 +169,11 @@ async fn send_file(path: &Path, addr: Option<String>, pin_opt: Option<String>) -
 
     let mut stream = TcpStream::connect(&target).await.context("Gagal sambung TCP")?;
 
-    // Handshake: Hantar salt (16 bait) + encrypted header (nonce = 0)
-    let header_json = serde_json::to_vec(&FileHeader { filename: filename.clone(), size, sha256 })?;
+    let header_json = serde_json::to_vec(&FileHeader {
+        filename: filename.clone(),
+        size,
+        sha256,
+    })?;
     let enc_header = crypto::encrypt_chunk(&cipher, 0, &header_json)?;
 
     stream.write_all(&salt).await?;
@@ -133,7 +184,6 @@ async fn send_file(path: &Path, addr: Option<String>, pin_opt: Option<String>) -
         bail!("❌ Penerima menolak sambungan (PIN tidak sepadan)!");
     }
 
-    // Stream fail dengan AES-256-GCM
     let pb = make_progress_bar(size)?;
     let mut file = File::open(path).await?;
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -151,23 +201,26 @@ async fn send_file(path: &Path, addr: Option<String>, pin_opt: Option<String>) -
         counter += 1;
     }
 
-    stream.write_u32(0).await?; // Penanda tamat fail (EOF)
+    stream.write_u32(0).await?;
     stream.flush().await?;
     pb.finish_with_message("Selesai");
 
     if stream.read_u8().await? == 1 {
-        println!("🎉 '{}' berjaya dihantar & disahkan SHA-256!", filename);
+        println!("\n🎉 \x1b[1;32m'{}' berjaya dihantar & disahkan SHA-256!\x1b[0m", filename);
     }
     Ok(())
 }
 
-async fn receive_file(port: u16, pin_opt: Option<String>) -> Result<()> {
+async fn receive_file(port: u16, pin_opt: Option<String>, name: Option<String>) -> Result<()> {
     let pin = pin_opt.unwrap_or_else(|| rand::thread_rng().gen_range(1000..=9999).to_string());
-    discovery::spawn_responder(port).await?;
+    let label = name.clone().unwrap_or_else(|| "Default-Host".to_string());
+    discovery::spawn_responder(port, name).await?;
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    println!("📡 Menunggu kiriman fail di port TCP {} (UDP Auto-Discovery aktif)", port);
-    println!("🔐 Kod PIN Keselamatan: {}", pin);
+    print_banner(&format!("MOD PENERIMA AKTIF — SERVER: {} (Port {})", label, port));
+    println!("📡 UDP Auto-Discovery : \x1b[1;32mAKTIF (Port 9999)\x1b[0m");
+    println!("🔐 Kod PIN Keselamatan : \x1b[1;33;44m  {}  \x1b[0m\n", pin);
+    println!("⏳ Menunggu penghantar memilih server ini...");
 
     let (mut stream, peer) = listener.accept().await?;
     println!("🔗 Sambungan masuk daripada {}", peer);
@@ -195,7 +248,9 @@ async fn receive_file(port: u16, pin_opt: Option<String>) -> Result<()> {
     };
 
     let header: FileHeader = serde_json::from_slice(&header_bytes)?;
-    let safe_name = Path::new(&header.filename).file_name().context("Nama fail tidak sah")?;
+    let safe_name = Path::new(&header.filename)
+        .file_name()
+        .context("Nama fail tidak sah")?;
     tokio::fs::create_dir_all("received").await?;
     let out_path = Path::new("received").join(safe_name);
 
@@ -230,6 +285,9 @@ async fn receive_file(port: u16, pin_opt: Option<String>) -> Result<()> {
     }
 
     stream.write_u8(1).await?;
-    println!("✅ Disimpan di {:?} (AES-256-GCM + SHA-256 sah!)", out_path);
+    println!(
+        "\n✅ \x1b[1;32mDisimpan di {:?} (AES-256-GCM + SHA-256 sah!)\x1b[0m",
+        out_path
+    );
     Ok(())
 }
